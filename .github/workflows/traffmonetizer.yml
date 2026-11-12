@@ -1,0 +1,111 @@
+name: Sync TraffMonetizer CLI_V2 Multi-arch Image
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 17 * * *' # UTC17:00 = 北京时间 01:00
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    outputs:
+      need_sync: ${{ steps.check_digest.outputs.need_sync }}
+    env:
+      DST_REPO: ${{ secrets.DOCKERHUB_REPO }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Check digest diff (判断是否需要同步)
+        id: check_digest
+        run: |
+          set -e
+          # 上游公开源镜像
+          SRC_AMD64="traffmonetizer/cli_v2:latest"
+          SRC_ARMV7="traffmonetizer/cli_v2:arm32v7"
+          SRC_ARM64="traffmonetizer/cli_v2:arm64v8"
+          # 目标镜像
+          DST_AMD64="${DST_REPO}:amd64"
+          DST_ARMV7="${DST_REPO}:armv7"
+          DST_ARM64="${DST_REPO}:arm64"
+
+          get_digest() {
+            local img="$1"
+            if docker buildx imagetools inspect --raw "$img" > /tmp/m.json 2>/dev/null; then
+              jq -r '.config.digest // "NOT_FOUND"' /tmp/m.json
+            else
+              echo "NOT_FOUND"
+            fi
+          }
+
+          SRC_DIGEST_AMD64=$(get_digest "$SRC_AMD64")
+          SRC_DIGEST_ARMV7=$(get_digest "$SRC_ARMV7")
+          SRC_DIGEST_ARM64=$(get_digest "$SRC_ARM64")
+
+          DST_DIGEST_AMD64=$(get_digest "$DST_AMD64")
+          DST_DIGEST_ARMV7=$(get_digest "$DST_ARMV7")
+          DST_DIGEST_ARM64=$(get_digest "$DST_ARM64")
+
+          echo "SRC_AMD64_DIGEST=$SRC_DIGEST_AMD64"
+          echo "SRC_ARMV7_DIGEST=$SRC_DIGEST_ARMV7"
+          echo "SRC_ARM64_DIGEST=$SRC_DIGEST_ARM64"
+          echo "DST_AMD64_DIGEST=$DST_DIGEST_AMD64"
+          echo "DST_ARMV7_DIGEST=$DST_DIGEST_ARMV7"
+          echo "DST_ARM64_DIGEST=$DST_DIGEST_ARM64"
+
+          # 手动触发强制同步
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            NEED_SYNC="true"
+            echo "ℹ️ 手动触发，强制执行上传"
+          else
+            NEED_SYNC="false"
+            if [ "$SRC_DIGEST_AMD64" != "$DST_DIGEST_AMD64" ]; then NEED_SYNC="true"; fi
+            if [ "$SRC_DIGEST_ARMV7" != "$DST_DIGEST_ARMV7" ]; then NEED_SYNC="true"; fi
+            if [ "$SRC_DIGEST_ARM64" != "$DST_DIGEST_ARM64" ]; then NEED_SYNC="true"; fi
+          fi
+
+          echo "need_sync=$NEED_SYNC" >> $GITHUB_OUTPUT
+          if [ "$NEED_SYNC" = "false" ]; then
+            echo "✅ 所有源镜像digest和仓库一致，跳过同步"
+          fi
+
+      - name: Login Docker Hub
+        if: steps.check_digest.outputs.need_sync == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Copy each arch manifest (直接registry复制，不再本地pull)
+        if: steps.check_digest.outputs.need_sync == 'true'
+        run: |
+          set +x
+          # amd64
+          docker buildx imagetools create \
+            -t ${DST_REPO}:amd64 \
+            traffmonetizer/cli_v2:latest
+
+          # arm/v7
+          docker buildx imagetools create \
+            -t ${DST_REPO}:armv7 \
+            traffmonetizer/cli_v2:arm32v7
+
+          # arm64/v8
+          docker buildx imagetools create \
+            -t ${DST_REPO}:arm64 \
+            traffmonetizer/cli_v2:arm64v8
+
+      - name: Combine to multi-arch latest manifest
+        if: steps.check_digest.outputs.need_sync == 'true'
+        run: |
+          set +x
+          docker buildx imagetools create \
+            -t ${DST_REPO}:latest \
+            ${DST_REPO}:amd64 \
+            ${DST_REPO}:armv7 \
+            ${DST_REPO}:arm64
+
+      - name: Inspect manifest
+        if: steps.check_digest.outputs.need_sync == 'true'
+        run: |
+          set +x
+          docker buildx imagetools inspect --raw ${DST_REPO}:latest | jq 'del(.manifests[].digest)' | grep -v "${DST_REPO}"
